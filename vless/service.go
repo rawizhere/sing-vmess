@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/sagernet/sing-vmess"
 	"github.com/sagernet/sing/common/auth"
@@ -23,6 +24,9 @@ type Service[T comparable] struct {
 	userFlow map[T]string
 	logger   logger.Logger
 	handler  Handler
+	conns    map[T][]net.Conn
+
+	mu sync.RWMutex
 }
 
 type Handler interface {
@@ -34,6 +38,7 @@ func NewService[T comparable](logger logger.Logger, handler Handler) *Service[T]
 	return &Service[T]{
 		logger:  logger,
 		handler: handler,
+		conns:   make(map[T][]net.Conn),
 	}
 }
 
@@ -48,8 +53,24 @@ func (s *Service[T]) UpdateUsers(userList []T, userUUIDList []string, userFlowLi
 		userMap[userID] = userName
 		userFlowMap[userName] = userFlowList[i]
 	}
+	s.mu.Lock()
 	s.userMap = userMap
 	s.userFlow = userFlowMap
+	var closedConns []net.Conn
+	newUserSet := make(map[T]struct{})
+	for _, user := range userList {
+		newUserSet[user] = struct{}{}
+	}
+	for user, conns := range s.conns {
+		if _, exists := newUserSet[user]; !exists {
+			closedConns = append(closedConns, conns...)
+			delete(s.conns, user)
+		}
+	}
+	s.mu.Unlock()
+	for _, conn := range closedConns {
+		conn.Close()
+	}
 }
 
 func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
@@ -61,12 +82,34 @@ func (s *Service[T]) NewConnectionWithOptions(ctx context.Context, conn net.Conn
 	if err != nil {
 		return err
 	}
+	s.mu.RLock()
 	user, loaded := s.userMap[request.UUID]
 	if !loaded {
+		s.mu.RUnlock()
 		return E.New("unknown UUID: ", uuid.FromBytesOrNil(request.UUID[:]))
 	}
-	ctx = auth.ContextWithUser(ctx, user)
 	userFlow := s.userFlow[user]
+	s.mu.RUnlock()
+	ctx = auth.ContextWithUser(ctx, user)
+
+	s.mu.Lock()
+	s.conns[user] = append(s.conns[user], conn)
+	s.mu.Unlock()
+	originalOnClose := onClose
+	onClose = N.OnceClose(func(it error) {
+		s.mu.Lock()
+		conns := s.conns[user]
+		for i, c := range conns {
+			if c == conn {
+				s.conns[user] = append(conns[:i], conns[i+1:]...)
+				break
+			}
+		}
+		s.mu.Unlock()
+		if originalOnClose != nil {
+			originalOnClose(it)
+		}
+	})
 	if request.Flow == FlowVision && request.Command == vmess.NetworkUDP {
 		return E.New(FlowVision, " flow does not support UDP")
 	} else if request.Flow != userFlow {
