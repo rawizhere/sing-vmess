@@ -412,6 +412,8 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	return nil
 }
 
+var _ N.EarlyWriter = (*rawServerConn)(nil)
+
 type rawServerConn struct {
 	net.Conn
 	legacyProtocol bool
@@ -487,7 +489,7 @@ func (c *rawServerConn) RearHeadroom() int {
 	return MaxRearHeadroom
 }
 
-func (c *rawServerConn) NeedHandshake() bool {
+func (c *rawServerConn) NeedHandshakeForWrite() bool {
 	return c.writer == nil
 }
 
